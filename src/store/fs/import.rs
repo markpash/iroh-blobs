@@ -13,15 +13,15 @@
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Seek, Write},
+    io::{self, Write},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
 };
 
-use bao_tree::{
-    io::outboard::{PreOrderMemOutboard, PreOrderOutboard},
-    BaoTree, ChunkNum,
-};
+use bao_tree::io::{outboard::PreOrderMemOutboard, sync::ReadAt};
 use bytes::Bytes;
 use genawaiter::sync::Gen;
 use irpc::{
@@ -29,11 +29,17 @@ use irpc::{
     Channels, WithChannels,
 };
 use n0_future::{stream, Stream, StreamExt};
-use ref_cast::RefCast;
 use smallvec::SmallVec;
 use tracing::{instrument, trace};
 
-use super::{meta::raw_outboard_size, options::Options, TaskContext};
+use n0_future::time::Duration;
+
+use super::{
+    meta::raw_outboard_size,
+    options::Options,
+    parallel_outboard::{self, PIECE_BLOCKS},
+    TaskContext,
+};
 use crate::{
     api::{
         blobs::{AddProgressItem, ImportMode},
@@ -47,7 +53,6 @@ use crate::{
         util::{MemOrFile, DD},
         IROH_BLOCK_SIZE,
     },
-    util::{outboard_with_progress::init_outboard, sink::Sink},
     BlobFormat, Hash,
 };
 
@@ -88,15 +93,6 @@ impl ImportSource {
 
     fn is_mem(&self) -> bool {
         matches!(self, Self::Memory(_))
-    }
-
-    /// A reader for the import source.
-    fn read(&self) -> MemOrFile<std::io::Cursor<&[u8]>, &File> {
-        match self {
-            Self::TempFile(_, file, _) => MemOrFile::File(file),
-            Self::External(_, file, _) => MemOrFile::File(file),
-            Self::Memory(data) => MemOrFile::Mem(std::io::Cursor::new(data.as_ref())),
-        }
     }
 
     /// The size of the import source.
@@ -351,24 +347,6 @@ async fn get_import_source(
     })
 }
 
-#[derive(ref_cast::RefCast)]
-#[repr(transparent)]
-struct OutboardProgress(mpsc::Sender<AddProgressItem>);
-
-impl Sink<ChunkNum> for OutboardProgress {
-    type Error = irpc::channel::SendError;
-
-    async fn send(&mut self, offset: ChunkNum) -> std::result::Result<(), Self::Error> {
-        // if offset.0 % 1024 != 0 {
-        //     return Ok(());
-        // }
-        self.0
-            .try_send(AddProgressItem::OutboardProgress(offset.to_bytes()))
-            .await?;
-        Ok(())
-    }
-}
-
 async fn compute_outboard(
     source: ImportSource,
     format: BlobFormat,
@@ -377,37 +355,88 @@ async fn compute_outboard(
     tx: &mut mpsc::Sender<AddProgressItem>,
 ) -> io::Result<ImportEntry> {
     let size = source.size();
-    let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
-    let root = bao_tree::blake3::Hash::from_bytes([0; 32]);
-    let outboard_size = raw_outboard_size(size);
-    let send_progress = OutboardProgress::ref_cast_mut(tx);
-    let mut data = source.read();
-    data.rewind()?;
-    let (hash, outboard) = if outboard_size > options.inline.max_outboard_inlined {
-        // outboard will eventually be stored as a file, so compute it directly to a file
-        // we don't know the hash yet, so we need to create a temp file
-        let outboard_path = options.path.temp_file_name();
-        trace!("Creating outboard file in {}", outboard_path.display());
-        // we don't need to read from this file!
-        let mut outboard_file = File::create(&outboard_path)?;
-        let mut outboard = PreOrderOutboard {
-            tree,
-            root,
-            data: &mut outboard_file,
-        };
-        init_outboard(data, &mut outboard, send_progress).await??;
-        (outboard.root, MemOrFile::File(outboard_path))
-    } else {
-        // outboard will be stored in memory, so compute it to a memory buffer
-        trace!("Creating outboard in memory");
-        let mut outboard_file: Vec<u8> = Vec::new();
-        let mut outboard = PreOrderOutboard {
-            tree,
-            root,
-            data: &mut outboard_file,
-        };
-        init_outboard(data, &mut outboard, send_progress).await??;
-        (outboard.root, MemOrFile::Mem(Bytes::from(outboard_file)))
+    if raw_outboard_size(size) == 0 {
+        // A single block has no outboard and hashes in microseconds, so it is
+        // not worth a trip to the rayon pool.
+        let hash = parallel_outboard::compute(
+            &source,
+            size,
+            Vec::new(),
+            PIECE_BLOCKS,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        )?;
+        return Ok(ImportEntry {
+            hash: hash.into(),
+            format,
+            scope,
+            source,
+            outboard: MemOrFile::empty(),
+        });
+    }
+    // A large outboard will eventually be stored as a file, so compute it
+    // directly to a temp file, since we don't know the hash yet.
+    let outboard_path = (raw_outboard_size(size) > options.inline.max_outboard_inlined)
+        .then(|| options.path.temp_file_name());
+    let outboard_file = outboard_path.as_ref().map(File::create).transpose()?;
+    let progress = Arc::new(AtomicU64::new(0));
+    let cancel = CancelOnDrop::default();
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+    {
+        let progress = progress.clone();
+        let cancel = cancel.0.clone();
+        // Hashing is CPU bound, so it runs on the rayon pool rather than
+        // blocking the async runtime.
+        rayon::spawn(move || {
+            let res = match outboard_file {
+                Some(file) => parallel_outboard::compute(
+                    &source,
+                    size,
+                    file,
+                    PIECE_BLOCKS,
+                    &progress,
+                    &cancel,
+                )
+                .map(|hash| (hash, Vec::new())),
+                None => {
+                    let mut mem = Vec::new();
+                    parallel_outboard::compute(
+                        &source,
+                        size,
+                        &mut mem,
+                        PIECE_BLOCKS,
+                        &progress,
+                        &cancel,
+                    )
+                    .map(|hash| (hash, mem))
+                }
+            };
+            done_tx.send((source, res)).ok();
+        });
+    }
+    let res = loop {
+        match n0_future::time::timeout(PROGRESS_INTERVAL, &mut done_rx).await {
+            Ok(done) => break done.map_err(|_| io::Error::other("outboard computation panicked")),
+            Err(_) => {
+                let offset = progress.load(Ordering::Relaxed);
+                if let Err(cause) = tx.try_send(AddProgressItem::OutboardProgress(offset)).await {
+                    break Err(cause.into());
+                }
+            }
+        }
+    };
+    let (source, hash, mem) = match res.and_then(|(source, res)| res.map(|(h, m)| (source, h, m))) {
+        Ok(v) => v,
+        Err(cause) => {
+            if let Some(path) = &outboard_path {
+                fs::remove_file(path).ok();
+            }
+            return Err(cause);
+        }
+    };
+    let outboard = match outboard_path {
+        Some(path) => MemOrFile::File(path),
+        None => MemOrFile::Mem(Bytes::from(mem)),
     };
     Ok(ImportEntry {
         hash: hash.into(),
@@ -416,6 +445,29 @@ async fn compute_outboard(
         source,
         outboard,
     })
+}
+
+/// How often outboard progress is reported while hashing.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Tells the hashing task to stop when the import is dropped, e.g. because
+/// the requester went away.
+#[derive(Default)]
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+impl ReadAt for ImportSource {
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::TempFile(_, file, _) | Self::External(_, file, _) => file.read_at(pos, buf),
+            Self::Memory(data) => data.as_ref().read_at(pos, buf),
+        }
+    }
 }
 
 #[instrument(skip_all, fields(path = %cmd.path.display()))]

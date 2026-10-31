@@ -43,6 +43,7 @@ iroh-metrics = { version = "1.0.1" }
 iroh-util = "0.6.0"
 redb = { version = "4.1.0", optional = true }
 reflink-copy = { version = "0.1.24", optional = true }
+rayon = { version = "1.10", optional = true }
 n0-error = "1.0.0"
 nested_enum_utils = "0.2.3"
 
@@ -89,7 +90,7 @@ pre-release-hook = ["git", "cliff", "--unreleased", "--tag", "{{version}}", "--p
 hide-proto-docs = []
 metrics = []
 default = ["hide-proto-docs", "fs-store", "rpc"]
-fs-store = ["dep:redb", "dep:reflink-copy", "bao-tree/fs"]
+fs-store = ["dep:redb", "dep:reflink-copy", "dep:rayon", "bao-tree/fs"]
 rpc = ["dep:noq", "irpc/rpc", "irpc/noq_endpoint_setup"]
 
 [[example]]
